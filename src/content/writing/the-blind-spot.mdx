@@ -1,0 +1,40 @@
+---
+title: "The Blind Spot: Why Race Conditions Keep Beating Engineering Teams Who Should Know Better"
+date: "2026-06-20"
+tag: "research"
+excerpt: "A working paper on timing bugs, why they hide, how they resolve, and what changes after they're found."
+---
+
+### A working paper on timing bugs, why they hide, how they resolve, and what changes after they're found
+
+## I. The first symptom is never the root cause
+
+At 11:48 PM PDT on October 19, 2025, engineers monitoring Amazon Web Services in Northern Virginia started seeing something that, on its face, looked like a DNS problem. Within minutes, DynamoDB had gone dark in US-EAST-1. Within hours, EC2 instance launches were failing. Within half a day, Snapchat, Fortnite, and the UK's tax authority were all degraded or down.
+
+The DNS failure was not the root cause. It was the first visible symptom of a race condition inside an internal DynamoDB microservice — a stale plan, applied a few seconds too late, against a world that had already moved on.
+
+> Race conditions don't punish carelessness. They punish the assumption, buried in a few ordinary-looking lines, that the world will hold still between the moment you check something and the moment you act on it.
+
+## II. What a race condition actually is, precisely
+
+A race condition occurs when the correctness of a program depends on the relative timing of two or more operations on shared state, and that timing isn't controlled by the program itself. The bug isn't that two things happened "at once" — it's that the *order* was allowed to vary, and at least one ordering produces a wrong result.
+
+```js
+// the shape almost every wallet/coupon/inventory race takes
+const wallet = await db.wallets.findOne({ id });      // check
+const updated = wallet.balance - amount;               // compute
+await db.wallets.update({ id }, { balance: updated }); // use — minutes, or microseconds, later
+```
+
+Two concurrent calls to this function can both read the same starting balance, both compute independently, and the second write silently overwrites the first. No error. No warning. Just gone.
+
+## III. A short taxonomy
+
+- **Lost update** — two writers, one silent overwrite.
+- **Dirty read** — reading a value that gets rolled back a moment later.
+- **Write skew** — two individually valid decisions that violate an invariant together.
+- **TOCTOU** — the general pattern underneath all of the above.
+
+---
+
+*This is a working excerpt — the full 5,400-word piece, with 37 linked sources covering Knight Capital, AWS's October 2025 outage, the Lu et al. concurrency-bug study, and the business-size breakdown, lives in the complete version of this paper.*
