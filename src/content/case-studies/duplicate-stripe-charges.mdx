@@ -1,0 +1,89 @@
+---
+title: "$25,300 in duplicate Stripe charges on a Vercel + Postgres stack"
+date: "2026-06-15"
+tag: "post-mortem"
+excerpt: "A checkout route without idempotency handling let concurrent retries create double charges. Walk-through of the race, the fix, and the recovery script."
+stack: "node / prisma / stripe"
+illustrative: true
+---
+
+## The symptom
+
+Finance flagged 47 transactions over a two-week window where customers were charged twice for the same order. Total exposure: $25,300. Stripe's dashboard showed two `payment_intent.succeeded` events per affected order, each with a distinct `PaymentIntent` ID.
+
+Support tickets clustered on Friday afternoons — exactly when the product ran a promotional email campaign that spiked concurrent checkouts.
+
+## What the code was doing
+
+The checkout endpoint created a `PaymentIntent` and immediately confirmed it, then wrote the result to a `orders` table:
+
+```ts
+// src/pages/api/checkout.ts (before)
+const intent = await stripe.paymentIntents.create({
+  amount,
+  currency: "usd",
+  confirm: true,
+  payment_method: body.paymentMethodId,
+});
+
+await prisma.order.create({
+  data: { stripeIntentId: intent.id, userId, amount, status: "paid" },
+});
+```
+
+Vercel's function timeout is 10 seconds. On slow Postgres write paths during traffic spikes, the `prisma.order.create` call sometimes exceeded it. The client — a React checkout form with a built-in retry — would re-POST. A new `PaymentIntent` was created each time, with no check for an existing one.
+
+## The race
+
+```
+Client POST /api/checkout  (attempt 1)
+  → stripe.paymentIntents.create()  → intent_A charged ✓
+  → prisma.order.create()           → timeout at 9.8 s
+  → client receives 504
+
+Client POST /api/checkout  (attempt 2, auto-retry)
+  → stripe.paymentIntents.create()  → intent_B charged ✓
+  → prisma.order.create()           → succeeds
+  → client receives 200
+```
+
+Attempt 1's charge had already succeeded at Stripe. The timeout only happened on the write side. Two charges, one order record.
+
+## The fix
+
+Two changes, both required:
+
+**1. Idempotency key on every PaymentIntent create:**
+
+```ts
+const idempotencyKey = `checkout-${userId}-${cartHash}`;
+
+const intent = await stripe.paymentIntents.create(
+  { amount, currency: "usd", confirm: true, payment_method: body.paymentMethodId },
+  { idempotencyKey }
+);
+```
+
+Stripe deduplicates creates with the same key within 24 hours, returning the original `PaymentIntent` instead of creating a new one.
+
+**2. Upsert instead of create, keyed on `stripeIntentId`:**
+
+```ts
+await prisma.order.upsert({
+  where: { stripeIntentId: intent.id },
+  update: {},
+  create: { stripeIntentId: intent.id, userId, amount, status: "paid" },
+});
+```
+
+If the timeout happened before the first write and the retry fires with the same idempotency key, `intent.id` is identical — the upsert is a no-op on the second call.
+
+## Recovery
+
+A Node script cross-referenced Stripe's `PaymentIntent` list against the orders table. For each order with two matching intents, the later charge was refunded via `stripe.refunds.create`. Customers were notified by email within 6 hours of the fix deploying.
+
+## What to carry forward
+
+- Never create a `PaymentIntent` without an idempotency key derived from stable, user-specific state.
+- Treat any write that follows an external API call as potentially retried — `upsert` or `insert … on conflict do nothing` by default.
+- Function timeouts don't roll back Stripe calls. The two systems can desync. Design for it.

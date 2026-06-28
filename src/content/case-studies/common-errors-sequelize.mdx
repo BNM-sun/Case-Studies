@@ -1,0 +1,144 @@
+---
+title: "COMMON_ERRORS.md — Sequelize transactions and row-level locking"
+date: "2026-05-28"
+tag: "reference"
+excerpt: "A reproduced catalog of the transaction and locking errors that show up most often in Sequelize codebases, with minimal reproduction cases and the correct fix for each."
+stack: "sequelize / sqlite"
+illustrative: false
+---
+
+## About this reference
+
+These errors were reproduced in an isolated Node + Sequelize + SQLite environment. Each entry includes the triggering code pattern, the exact error or wrong-result behavior, and the corrected version. SQLite is used for portability; where PostgreSQL behavior differs meaningfully, it's noted.
+
+---
+
+## 1. Transaction not passed to query — silent read outside transaction
+
+**Symptom:** Data written inside a transaction is not visible to subsequent queries, or a query reads stale data, even though a transaction is open.
+
+```ts
+// wrong
+const t = await sequelize.transaction();
+await User.create({ name: "Alice" }, { transaction: t });
+const users = await User.findAll(); // reads BEFORE commit — Alice may be invisible
+await t.commit();
+```
+
+**Fix:** Pass `{ transaction: t }` to every query inside the transaction scope:
+
+```ts
+const t = await sequelize.transaction();
+await User.create({ name: "Alice" }, { transaction: t });
+const users = await User.findAll({ transaction: t }); // sees Alice
+await t.commit();
+```
+
+**Note:** Sequelize does not implicitly enlist queries in an open transaction. Every query that should participate must be passed the transaction object explicitly.
+
+---
+
+## 2. Missing `LOCK.UPDATE` on read-modify-write — lost update
+
+**Symptom:** Two concurrent transactions read the same row, both modify it, and one update silently overwrites the other.
+
+```ts
+// wrong — classic lost update
+const t = await sequelize.transaction();
+const account = await Account.findOne({ where: { id }, transaction: t }); // shared read lock
+account.balance -= 100;
+await account.save({ transaction: t });
+await t.commit();
+```
+
+Under concurrent load, two transactions can both read `balance = 500`, both compute `400`, and the second write destroys the first decrement.
+
+**Fix:** Acquire a write (exclusive) lock on the row at read time:
+
+```ts
+const { LOCK } = require("sequelize");
+const t = await sequelize.transaction();
+const account = await Account.findOne({
+  where: { id },
+  lock: LOCK.UPDATE,
+  transaction: t,
+});
+account.balance -= 100;
+await account.save({ transaction: t });
+await t.commit();
+```
+
+`SELECT … FOR UPDATE` blocks any concurrent transaction from acquiring a lock on the same row until the first transaction commits or rolls back.
+
+---
+
+## 3. Unhandled rejection in transaction callback — connection leak
+
+**Symptom:** A transaction started with `sequelize.transaction(callback)` leaks a connection when the callback throws synchronously.
+
+```ts
+// wrong
+await sequelize.transaction(async (t) => {
+  const item = await Item.findOne({ where: { id: 999 }, transaction: t });
+  if (!item) throw new Error("not found"); // thrown before any async boundary
+  await item.update({ qty: item.qty - 1 }, { transaction: t });
+});
+```
+
+In older Sequelize versions (< 6.29), a synchronous throw before the first `await` inside the managed callback could bypass the automatic rollback path.
+
+**Fix:** Ensure there is always an `await` before any throw, or wrap the callback body in a try/catch that calls `t.rollback()` explicitly when using unmanaged transactions:
+
+```ts
+// safe — managed transaction handles rollback automatically in Sequelize 6.29+
+await sequelize.transaction(async (t) => {
+  const item = await Item.findOne({ where: { id: 999 }, transaction: t });
+  if (!item) throw new Error("not found"); // now after an await — rollback fires
+  await item.update({ qty: item.qty - 1 }, { transaction: t });
+});
+```
+
+---
+
+## 4. Deadlock on reverse lock acquisition order
+
+**Symptom:** `SequelizeDatabaseError: Deadlock found when trying to get lock` (MySQL/MariaDB) or transaction aborted with `ERROR 40P01` (PostgreSQL).
+
+**Cause:** Two transactions acquire row-level locks in opposite orders:
+
+```
+Transaction A: lock row 1 → wait for row 2
+Transaction B: lock row 2 → wait for row 1
+```
+
+**Fix:** Enforce a consistent lock acquisition order across all code paths. If two rows must be locked together, always lock the lower primary key first:
+
+```ts
+const [first, second] = [idA, idB].sort();
+const t = await sequelize.transaction();
+const r1 = await Row.findOne({ where: { id: first }, lock: LOCK.UPDATE, transaction: t });
+const r2 = await Row.findOne({ where: { id: second }, lock: LOCK.UPDATE, transaction: t });
+// ... proceed
+await t.commit();
+```
+
+Also instrument a retry loop around deadlock-prone paths: deadlocks are expected in high-concurrency systems and should be retried, not treated as fatal errors.
+
+---
+
+## 5. `transaction: t` on `bulkCreate` — rows not enrolled
+
+**Symptom:** Rows inserted via `Model.bulkCreate(records)` are committed outside the transaction, or not visible to subsequent queries within it.
+
+```ts
+// wrong — transaction silently ignored
+await Record.bulkCreate(rows); // missing { transaction: t }
+```
+
+`bulkCreate` accepts `{ transaction }` the same way `create` does — the omission is easy to miss because the method signature doesn't enforce it.
+
+**Fix:**
+
+```ts
+await Record.bulkCreate(rows, { transaction: t });
+```
